@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Capstone custom ignores
+data/*.db
+data/*.sqlite3
+data/*.csv
+data/*.xlsx
+data/faces/
+models/*.onnx
+models/*.pth
+models/*.pt
