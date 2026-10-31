@@ -1,4 +1,9 @@
-   opencv-python>=4.8
-   numpy
-   insightface
-   onnxruntime
+--extra-index-url https://download.pytorch.org/whl/cpu
+opencv-python>=4.8.0
+numpy>=1.24.0
+insightface>=0.7.3
+onnxruntime>=1.15.0
+torch
+torchvision
+streamlit>=1.25.0
+pandas>=2.0.0
