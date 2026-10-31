@@ -4,31 +4,68 @@ Owner: Karl Stephen V. Zubiri
 
 Can be imported by the main pipeline OR run directly (`python -m src.recognition.matcher`)
 to test face enrollment and cosine similarity matching independently before database/liveness modules are merged.
+
+Performance notes:
+  - Only the detection + recognition modules are loaded (no landmarks / gender-age).
+  - ONNX Runtime threads are capped and busy-waiting (spinning) is disabled, which is the
+    main cause of "100% CPU" on many-core machines. Tune with the env var DCCP_ORT_THREADS.
 """
 
+import os
+import time
 from typing import Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
 
 try:
+    import onnxruntime as ort
     from insightface.app import FaceAnalysis
 except ImportError:
+    ort = None
     FaceAnalysis = None
+
+
+def _build_session_options(num_threads: int):
+    """ONNX Runtime options: few threads, no busy-wait spinning."""
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = num_threads
+    so.inter_op_num_threads = 1
+    so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    return so
 
 
 class FaceRecognitionEngine:
     """Handles 512-D facial embedding extraction and cosine similarity matching via InsightFace."""
 
-    def __init__(self, det_size: Tuple[int, int] = (320, 320), sim_threshold: float = 0.50):
+    def __init__(
+        self,
+        det_size: Tuple[int, int] = (320, 320),
+        sim_threshold: float = 0.50,
+        num_threads: Optional[int] = None,
+    ):
         self.sim_threshold = sim_threshold
         self.app = None
-        if FaceAnalysis is not None:
-            self.app = FaceAnalysis(
+
+        if FaceAnalysis is None:
+            return
+
+        if num_threads is None:
+            num_threads = int(os.getenv("DCCP_ORT_THREADS", "2"))
+
+        kwargs = dict(
             name="buffalo_s",
             providers=["CPUExecutionProvider"],
             allowed_modules=["detection", "recognition"],  # skip landmarks & gender/age
         )
-            self.app.prepare(ctx_id=-1, det_size=det_size)   # -1 = CPU
+        try:
+            self.app = FaceAnalysis(sess_options=_build_session_options(num_threads), **kwargs)
+        except TypeError:
+            # Older insightface versions may not forward sess_options; fall back safely.
+            print("[WARN] This insightface version ignores sess_options; thread limit not applied.")
+            self.app = FaceAnalysis(**kwargs)
+
+        self.app.prepare(ctx_id=-1, det_size=det_size)  # -1 = CPU
 
     def extract_embedding(self, frame_bgr: np.ndarray) -> Optional[Tuple[np.ndarray, list]]:
         """
@@ -121,7 +158,13 @@ if __name__ == "__main__":
     in_memory_db: Dict[str, np.ndarray] = {}
 
     cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     print("[CONTROLS] Press 'e' to enroll your face as DCCP-KARL-001 | Press 'q' to quit.")
+
+    PROCESS_INTERVAL = 0.25  # seconds between recognitions
+    last_proc = 0.0
+    emp_id, score, bbox = None, 0.0, None
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -129,7 +172,10 @@ if __name__ == "__main__":
             break
 
         display = frame.copy()
-        emp_id, score, bbox = engine.recognize_employee(frame, in_memory_db)
+
+        if time.time() - last_proc >= PROCESS_INTERVAL:
+            last_proc = time.time()
+            emp_id, score, bbox = engine.recognize_employee(frame, in_memory_db)
 
         if bbox is not None:
             x1, y1, x2, y2 = bbox
