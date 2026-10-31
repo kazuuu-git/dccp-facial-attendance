@@ -3,7 +3,7 @@ import argparse
 import cv2
 import torch
 
-from .anti_spoof import load_model
+from .anti_spoof import load_models
 from .vendor.generate_patches import CropImage
 
 
@@ -32,34 +32,57 @@ def main():
         print("No face selected. Test cancelled.")
         return
 
-    crop = CropImage().crop(
-        org_img=image,
-        bbox=[x, y, width, height],
-        scale=2.7,
-        out_w=80,
-        out_h=80,
-        crop=True,
-    )
+    models = load_models()
+    cropper = CropImage()
 
-    # Preserve OpenCV BGR order and the reference 0–255 range.
-    tensor = (
-        torch.from_numpy(crop.transpose(2, 0, 1).copy())
-        .float()
-        .unsqueeze(0)
-    )
+    combined_scores = torch.zeros(3)
+    model_results = []
 
-    model = load_model()
+    for item in models:
+        crop = cropper.crop(
+            org_img=image,
+            bbox=[x, y, width, height],
+            scale=item["crop_scale"],
+            out_w=item["input_size"][0],
+            out_h=item["input_size"][1],
+            crop=True,
+        )
 
-    with torch.inference_mode():
-        logits = model(tensor)
-        scores = torch.softmax(logits, dim=1)[0]
+        # Preserve OpenCV BGR order and the reference 0-255 range.
+        tensor = (
+            torch.from_numpy(crop.transpose(2, 0, 1).copy())
+            .float()
+            .unsqueeze(0)
+        )
 
-    predicted_class = int(scores.argmax().item())
+        with torch.inference_mode():
+            logits = item["model"](tensor)
+            scores = torch.softmax(logits, dim=1)[0]
 
-    print("Class scores:", scores.tolist())
-    print("Live score:", round(scores[1].item(), 4))
+        combined_scores += scores
+
+        model_results.append(
+            {
+                "name": item["name"],
+                "crop_scale": item["crop_scale"],
+                "scores": scores,
+                "prediction": "LIVE" if int(scores.argmax().item()) == 1 else "SPOOF",
+            }
+        )
+
+    predicted_class = int(combined_scores.argmax().item())
+
+    print("\nIndividual model results:")
+    for result in model_results:
+        print(f"- {result['name']} (crop scale {result['crop_scale']}):")
+        print(f"  Scores: {result['scores'].tolist()}")
+        print(f"  Live score: {round(result['scores'][1].item(), 4)}")
+        print(f"  Prediction: {result['prediction']}")
+
+    print("\nCombined scores:", combined_scores.tolist())
+    print("Combined live score:", round(combined_scores[1].item(), 4))
     print(
-        "Single-model prediction:",
+        "Ensemble prediction:",
         "LIVE" if predicted_class == 1 else "SPOOF",
     )
     print("Diagnostic result only; not a validated security decision.")
