@@ -220,11 +220,44 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Capstone custom ignores
-data/*.db
-data/*.sqlite3
-data/*.csv
-data/*.xlsx
-data/faces/
-models/*.onnx
-models/*.pth
-models/*.pt
+
+# Runtime data: never commit employee/biometric data
+data/*
+!data/.gitkeep
+
+# SQLite databases and their sidecar files (any location)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Face embeddings / serialized arrays
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Face images and recordings (enrollment photos, spoof test captures)
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+
+# Model weights (download separately, see README)
+models/*
+!models/.gitkeep
+!models/README.md
+*.onnx
+*.pth
+*.pt
+
+# Local InsightFace model cache
+.insightface/
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
