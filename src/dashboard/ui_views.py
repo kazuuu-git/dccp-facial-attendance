@@ -5,6 +5,7 @@ import streamlit as st
 
 from src.dashboard import export_utils
 from src.database.db_manager import AttendanceDatabase
+from src.liveness.anti_spoof import PassiveLivenessEngine
 from src.recognition.matcher import FaceRecognitionEngine
 
 
@@ -30,7 +31,7 @@ def render_logs_view():
                 "date": ["2026-10-28", "2026-10-28", "2026-10-28"],
                 "time_in": ["07:45 AM", "07:52 AM", "08:05 AM"],
                 "time_out": ["--", "--", "--"],
-                "spoof_status": ["Passed", "Passed", "Failed (2D Photo)"],
+                "spoof_status": ["Passed", "Passed", "Failed (Spoof Detected, Score: 0.12)"],
             }
         )
 
@@ -70,10 +71,20 @@ def render_enrollment_view():
                     if result is None:
                         st.error("No face detected in the image. Please position your face clearly in the camera and try again.")
                     else:
-                        embedding, _ = result
-                        db = AttendanceDatabase()
-                        db.enroll_employee(emp_id.strip(), emp_name.strip(), embedding)
-                        st.success(f"Successfully enrolled {emp_name} ({emp_id})! 512-D embedding saved to SQLite.")
+                        embedding, bbox = result
+                        # Strict passive liveness verification
+                        liveness_engine = PassiveLivenessEngine()
+                        is_real, live_score = liveness_engine.check_passive_liveness(frame, bbox)
+
+                        if not is_real:
+                            st.error(
+                                f"❌ Biometric Enrollment Blocked: Anti-spoofing verification failed "
+                                f"(Live score: {live_score:.2f}). Please present a live, physical face in good lighting."
+                            )
+                        else:
+                            db = AttendanceDatabase()
+                            db.enroll_employee(emp_id.strip(), emp_name.strip(), embedding)
+                            st.success(f"Successfully enrolled {emp_name} ({emp_id})! 512-D embedding saved to SQLite.")
                 except Exception as e:
                     st.error(f"Enrollment failed: {e}")
 

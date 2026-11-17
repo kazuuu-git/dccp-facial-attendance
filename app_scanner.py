@@ -238,16 +238,20 @@ def run_attendance_scanner(
             if key == ord("e"):
                 res = recognition_engine.extract_embedding(frame)
                 if res is not None:
-                    emb, _ = res
-                    enrolled_db["DCCP-KARL-001"] = emb
-                    try:
-                        db.enroll_employee("DCCP-KARL-001", "Karl Stephen V. Zubiri", emb)
-                        print("[INFO] Enrolled DCCP-KARL-001 and persisted to database!")
-                        status_banner, banner_color = "Enrolled DCCP-KARL-001 (Saved to DB)!", (0, 200, 0)
-                    except Exception as err:
-                        print(f"[WARN] In-memory enroll succeeded, DB save failed: {err}")
-                        status_banner, banner_color = "Enrolled DCCP-KARL-001 (Session Only)!", (0, 200, 0)
-            elif key == ord("q"):
+                    emb, bbox_enroll = res
+                    is_live_enroll, live_score_enroll = liveness_engine.check_passive_liveness(frame, bbox_enroll)
+                    if not is_live_enroll:
+                        print(f"[SECURITY ALERT] Quick-enroll rejected: Spoof detected (score: {live_score_enroll:.2f})")
+                        status_banner, banner_color = f"Enrollment Blocked: Spoof Detected ({live_score_enroll:.2f})", (0, 0, 255)
+                    else:
+                        enrolled_db["DCCP-KARL-001"] = emb
+                        try:
+                            db.enroll_employee("DCCP-KARL-001", "Karl Stephen V. Zubiri", emb)
+                            print("[INFO] Enrolled DCCP-KARL-001 and persisted to database!")
+                            status_banner, banner_color = "Enrolled DCCP-KARL-001 (Saved to DB)!", (0, 200, 0)
+                        except Exception as err:
+                            print(f"[WARN] In-memory enroll succeeded, DB save failed: {err}")
+                            status_banner, banner_color = "Enrolled DCCP-KARL-001 (Session Only)!", (0, 200, 0)
                 break
     finally:
         cap.release()
