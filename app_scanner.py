@@ -85,7 +85,7 @@ def _camera_backend_name(cap) -> str:
 # stub or an in-memory database would let the scanner record attendance or enroll
 # faces without real verification or persistence. Fail before any camera work.
 try:
-    from src.liveness.anti_spoof import PassiveLivenessEngine
+    from src.liveness.anti_spoof import PassiveLivenessEngine, decision_to_result
 except Exception as e:
     raise ImportError(
         "Scanner cannot start: required passive liveness module "
@@ -100,6 +100,74 @@ except Exception as e:
         "Scanner cannot start: required database module "
         f"'src.database.db_manager' failed to import ({type(e).__name__}: {e})."
     ) from e
+
+# Diagnostics mode reads enrolled identities through a read-only connection only.
+from src.database import readonly_roster
+from src.database.readonly_roster import ReadOnlyEmployeeRoster
+
+GREEN = (0, 200, 0)
+RED = (0, 0, 255)
+YELLOW = (0, 255, 255)
+
+BLOCKED_BANNER = "BLOCKED: liveness check failed"
+DIAG_WINDOW_TITLE = "DCCP Scanner - DIAGNOSTICS (nothing recorded)"
+DIAG_HEADER = "DIAGNOSTICS MODE - no attendance or enrollment is recorded"
+DIAG_FOOTER = "Model scores are not calibrated probabilities."
+DIAG_NO_FACE = "No face detected"
+DIAG_ENROLL_DISABLED = "Enrollment disabled in diagnostics mode"
+
+
+def format_liveness_line(decision: dict) -> Tuple[str, Tuple[int, int, int]]:
+    """Overlay text for a liveness decision. Never shows percentages or probabilities.
+
+    INVALID shows no score, because the check could not be completed.
+    """
+    status = decision.get("status")
+    score = decision.get("live_score")
+    threshold = decision.get("threshold")
+    threshold_text = f" | threshold {threshold:.2f}" if threshold is not None else ""
+    if status in ("PASS", "REJECT") and score is not None:
+        color = GREEN if status == "PASS" else RED
+        return f"Liveness: {status} | model live score {score:.2f}{threshold_text}", color
+    return f"Liveness: INVALID - check could not be completed{threshold_text}", ORANGE
+
+
+def format_identity_line(roster, emp_id: Optional[str], sim_score: float) -> str:
+    """Diagnostics identity text. A read problem is never shown as an unknown person."""
+    if roster.state == readonly_roster.UNAVAILABLE:
+        return f"Identity matching off: {roster.reason}"
+    cached = " [cached roster: latest refresh failed]" if roster.state == readonly_roster.CACHED else ""
+    if roster.employee_count == 0:
+        return f"Identity: no employees enrolled{cached}"
+    if emp_id is not None:
+        return f"Identity: {emp_id} (similarity {sim_score:.2f}){cached}"
+    return f"Identity: no enrolled match (best similarity {sim_score:.2f}){cached}"
+
+
+def liveness_result_is_fresh(result_ts: Optional[float], now_ts: float, process_interval: float) -> bool:
+    """Liveness/identity results older than max(1s, 3 x interval) are not displayed."""
+    if result_ts is None:
+        return False
+    return (now_ts - result_ts) <= max(1.0, 3.0 * process_interval)
+
+
+def draw_label(img: np.ndarray, text: str, y: int, color, scale: float = 0.6, thickness: int = 1) -> int:
+    """Draws text on a dark backdrop, shrunk if needed to stay inside the frame.
+
+    Returns the baseline y for the next line.
+    """
+    h, w = img.shape[:2]
+    margin = 8
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), base = cv2.getTextSize(text, font, scale, thickness)
+    max_w = max(1, w - 2 * margin)
+    if tw > max_w:
+        scale = max(0.3, scale * max_w / tw)
+        (tw, th), base = cv2.getTextSize(text, font, scale, thickness)
+    y = int(min(max(y, th + margin), h - base - margin))
+    cv2.rectangle(img, (margin - 4, y - th - 4), (min(w - 1, margin + tw + 4), y + base + 2), (0, 0, 0), -1)
+    cv2.putText(img, text, (margin, y), font, scale, color, thickness, cv2.LINE_AA)
+    return y + th + base + 12
 
 
 def _print_latency(name: str, samples_s: List[float]) -> None:
@@ -120,8 +188,14 @@ def run_attendance_scanner(
     process_interval: float = PROCESS_INTERVAL,
     max_read_failures: Optional[int] = None,
     read_retry_delay: float = READ_RETRY_DELAY_SECONDS,
+    diagnostics: bool = False,
 ) -> None:
     """Runs the real-time DCCP employee attendance kiosk loop.
+
+    With diagnostics=True the same detection, recognition and liveness pipeline
+    runs, but nothing is written: AttendanceDatabase is never created, enrolled
+    identities are read through a read-only connection, and quick-enroll is
+    disabled.
 
     Raises CameraReadError if the camera returns `max_read_failures` unusable
     frames in a row, and ScannerConfigError for invalid configuration.
@@ -132,14 +206,35 @@ def run_attendance_scanner(
     elif isinstance(max_read_failures, bool) or not isinstance(max_read_failures, int) or max_read_failures < 1:
         raise ScannerConfigError(f"max_read_failures must be a positive integer, got {max_read_failures!r}.")
 
-    db = AttendanceDatabase()
+    db = None
+    roster = None
+    if diagnostics:
+        # Never AttendanceDatabase here: its constructor creates folders and tables.
+        roster = ReadOnlyEmployeeRoster()
+    else:
+        db = AttendanceDatabase()
     liveness_engine = PassiveLivenessEngine()
     recognition_engine = FaceRecognitionEngine()
 
-    enrolled_db = db.load_enrolled_embeddings()
-    print(f"[INFO] Loaded {len(enrolled_db)} enrolled DCCP employee profile(s).")
+    if diagnostics:
+        enrolled_db = roster.embeddings
+        print("[DIAGNOSTICS] No attendance records, blocked attempts or enrollments will be written.")
+        if roster.state == readonly_roster.UNAVAILABLE:
+            print(f"[DIAGNOSTICS] Identity matching off ({roster.reason}); running liveness-only.")
+        else:
+            print(f"[DIAGNOSTICS] Read-only roster loaded: {roster.employee_count} enrolled profile(s).")
+    else:
+        enrolled_db = db.load_enrolled_embeddings()
+        print(f"[INFO] Loaded {len(enrolled_db)} enrolled DCCP employee profile(s).")
     print(f"[INFO] Recognition interval: {process_interval:.2f}s | Min face width: {MIN_FACE_WIDTH}px | Lockout: {lockout_seconds:.0f}s")
-    print("[CONTROLS] Press 'e' to quick-enroll your face for testing | Press 'q' to quit.")
+    if diagnostics:
+        print("[CONTROLS] Press 'q' to quit. Enrollment is disabled in diagnostics mode.")
+    else:
+        print("[CONTROLS] Press 'e' to quick-enroll your face for testing | Press 'q' to quit.")
+
+    window_title = DIAG_WINDOW_TITLE if diagnostics else WINDOW_TITLE
+    ready_banner = DIAG_NO_FACE if diagnostics else READY_BANNER
+    watched_db_path = roster.db_path if diagnostics else db.db_path
 
     rec_times: List[float] = []
     live_times: List[float] = []
@@ -157,7 +252,7 @@ def run_attendance_scanner(
         cap.set(cv2.CAP_PROP_FPS, 15)
 
         last_logged_time: Dict[str, float] = {}
-        status_banner = READY_BANNER
+        status_banner = ready_banner
         banner_color = GREY
 
         bbox: Optional[list] = None  # cached between recognition cycles (for drawing only)
@@ -165,9 +260,15 @@ def run_attendance_scanner(
         consecutive_read_failures = 0
         frame_shape = (480, 640, 3)
 
+        # Display-only results of the latest processing cycle.
+        liveness_decision: Optional[dict] = None
+        identity_text: Optional[str] = None
+        result_ts: Optional[float] = None
+        diag_notice_until = 0.0  # diagnostics-only "enrollment disabled" notice
+
         def _get_db_mtime() -> float:
             try:
-                return os.path.getmtime(db.db_path) if os.path.exists(db.db_path) else 0.0
+                return os.path.getmtime(watched_db_path) if os.path.exists(watched_db_path) else 0.0
             except OSError:
                 return 0.0
 
@@ -182,8 +283,9 @@ def run_attendance_scanner(
                 # (e.g. a previous PASS) is shown for input we did not receive, and
                 # force fresh recognition on the next usable frame.
                 bbox = None
-                status_banner, banner_color = READY_BANNER, GREY
+                status_banner, banner_color = ready_banner, GREY
                 last_proc = 0.0
+                liveness_decision, identity_text, result_ts = None, None, None
 
                 if consecutive_read_failures == 1:
                     print("[WARN] Camera returned no usable frame; retrying.")
@@ -207,7 +309,7 @@ def run_attendance_scanner(
                     "Scanning paused: no faces are being checked.",
                     (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ORANGE, 2,
                 )
-                cv2.imshow(WINDOW_TITLE, status_frame)
+                cv2.imshow(window_title, status_frame)
                 # The pause doubles as the window's event pump; 'q' still quits.
                 key = cv2.waitKey(max(1, int(read_retry_delay * 1000))) & 0xFF
                 if key == ord("q"):
@@ -223,7 +325,13 @@ def run_attendance_scanner(
             if now_ts - last_db_check >= 1.0:
                 last_db_check = now_ts
                 current_mtime = _get_db_mtime()
-                if current_mtime != last_db_mtime:
+                if diagnostics:
+                    # Read-only refresh; retried while the roster is not AVAILABLE.
+                    if current_mtime != last_db_mtime or roster.state != readonly_roster.AVAILABLE:
+                        last_db_mtime = current_mtime
+                        roster.refresh()
+                        enrolled_db = roster.embeddings
+                elif current_mtime != last_db_mtime:
                     last_db_mtime = current_mtime
                     new_enrolled = db.load_enrolled_embeddings()
                     if set(new_enrolled.keys()) != set(enrolled_db.keys()):
@@ -238,26 +346,36 @@ def run_attendance_scanner(
             # Heavy work runs only on a timer, never on every frame.
             if now_ts - last_proc >= process_interval:
                 last_proc = now_ts
+                # Results from an earlier cycle never carry over to this one.
+                liveness_decision, identity_text, result_ts = None, None, None
 
                 t0 = time.perf_counter()
                 emp_id, sim_score, bbox = recognition_engine.recognize_employee(frame, enrolled_db)
                 rec_times.append(time.perf_counter() - t0)
 
                 if bbox is None:
-                    status_banner, banner_color = READY_BANNER, GREY
+                    status_banner, banner_color = ready_banner, GREY
 
                 elif (bbox[2] - bbox[0]) < MIN_FACE_WIDTH:
                     status_banner, banner_color = "Please move closer to the camera", GREY
 
                 else:
-                    # Passive liveness runs only on processed frames
+                    # Passive liveness runs only on processed frames, once: the same
+                    # decision drives attendance and the overlay.
                     t1 = time.perf_counter()
-                    is_real, liveness_score = liveness_engine.check_passive_liveness(frame, bbox)
+                    decision = liveness_engine.evaluate(frame, bbox)
                     live_times.append(time.perf_counter() - t1)
+                    is_real, liveness_score = decision_to_result(decision)
+                    liveness_decision, result_ts = decision, now_ts
 
-                    if not is_real:
-                        banner_color = (0, 0, 255)  # Red for spoof attack
-                        status_banner = f"SPOOF BLOCKED (Liveness: {liveness_score:.2f})"
+                    if diagnostics:
+                        # Display only: no attendance, blocked-attempt or enrollment writes.
+                        identity_text = format_identity_line(roster, emp_id, sim_score)
+                        status_banner, banner_color = "Face detected", GREY
+
+                    elif not is_real:
+                        banner_color = RED
+                        status_banner = BLOCKED_BANNER
                         if now_ts - last_logged_time.get("SPOOF", 0.0) > spoof_cooldown_seconds:
                             db.log_attendance(
                                 employee_id=emp_id,
@@ -292,26 +410,39 @@ def run_attendance_scanner(
                 x1, y1, x2, y2 = bbox
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), banner_color, 2)
 
-            cv2.putText(
-                display_frame,
-                status_banner,
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                banner_color,
-                2,
+            show_result = liveness_decision is not None and liveness_result_is_fresh(
+                result_ts, now_ts, process_interval
             )
-            cv2.imshow(WINDOW_TITLE, display_frame)
+            if diagnostics:
+                y = draw_label(display_frame, DIAG_HEADER, 28, YELLOW, 0.6, 2)
+                y = draw_label(display_frame, status_banner, y, banner_color)
+                if now_ts < diag_notice_until:
+                    y = draw_label(display_frame, DIAG_ENROLL_DISABLED, y, ORANGE)
+                if show_result:
+                    if identity_text:
+                        y = draw_label(display_frame, identity_text, y, GREY)
+                    live_text, live_color = format_liveness_line(liveness_decision)
+                    draw_label(display_frame, live_text, y, live_color)
+                draw_label(display_frame, DIAG_FOOTER, display_frame.shape[0] - 12, GREY, 0.5)
+            else:
+                y = draw_label(display_frame, status_banner, 40, banner_color, 0.75, 2)
+                if show_result:
+                    live_text, live_color = format_liveness_line(liveness_decision)
+                    draw_label(display_frame, live_text, y, live_color)
+            cv2.imshow(window_title, display_frame)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("e"):
+            if key == ord("e") and diagnostics:
+                # No extraction, liveness check or database access for enrollment.
+                diag_notice_until = time.time() + 2.0
+            elif key == ord("e"):
                 res = recognition_engine.extract_embedding(frame)
                 if res is not None:
                     emb, bbox_enroll = res
                     is_live_enroll, live_score_enroll = liveness_engine.check_passive_liveness(frame, bbox_enroll)
                     if not is_live_enroll:
-                        print(f"[SECURITY ALERT] Quick-enroll rejected: Spoof detected (score: {live_score_enroll:.2f})")
-                        status_banner, banner_color = f"Enrollment Blocked: Spoof Detected ({live_score_enroll:.2f})", (0, 0, 255)
+                        print("[SECURITY ALERT] Quick-enroll rejected: liveness check failed.")
+                        status_banner, banner_color = f"Enrollment {BLOCKED_BANNER}", RED
                     else:
                         enrolled_db["DCCP-KARL-001"] = emb
                         try:
@@ -337,10 +468,19 @@ def run_attendance_scanner(
         _print_latency("liveness", live_times)
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     """Runs the scanner and maps known failures to process exit codes."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DCCP attendance scanner")
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Show liveness/identity results only; write no attendance, blocked attempts or enrollments.",
+    )
+    args = parser.parse_args(argv if argv is not None else [])
     try:
-        run_attendance_scanner()
+        run_attendance_scanner(diagnostics=args.diagnostics)
     except CameraReadError as err:
         print(f"[ERROR] {err}", file=sys.stderr)
         return EXIT_CAMERA_READ_FAILURE
@@ -354,4 +494,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

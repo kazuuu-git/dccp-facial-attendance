@@ -141,11 +141,24 @@ class PassiveLivenessEngine:
             f"model(s): {model_names} (threshold={self.threshold:.2f})."
         )
 
+    def _invalid(self, reason: str) -> dict:
+        """Decision for a check that could not be completed (no score is reported)."""
+        return {
+            "status": "INVALID",
+            "passed": False,
+            "live_score": None,
+            "average_scores": None,
+            "threshold": self.threshold,
+            "reason": reason,
+        }
+
     def check_passive_liveness(
         self, frame_bgr: np.ndarray, bbox: Optional[List[int]] = None
     ) -> Tuple[bool, float]:
         """
         Evaluates whether a detected face is live or a spoof attack.
+
+        Backward-compatible wrapper around evaluate(); runs inference once.
 
         Args:
             frame_bgr: Full frame from camera in OpenCV BGR format.
@@ -154,15 +167,28 @@ class PassiveLivenessEngine:
         Returns:
             Tuple of (is_real: bool, liveness_score: float)
             - is_real is True ONLY IF LIVE uniquely wins and live_score >= threshold.
-            - liveness_score is the average softmax probability for the LIVE class.
+            - liveness_score is the average softmax score for the LIVE class
+              (0.0 when the check could not be completed).
+        """
+        return decision_to_result(self.evaluate(frame_bgr, bbox))
+
+    def evaluate(
+        self, frame_bgr: np.ndarray, bbox: Optional[List[int]] = None
+    ) -> dict:
+        """
+        Runs passive liveness inference once and returns the full decision.
+
+        Returns a dict with keys: status ("PASS" | "REJECT" | "INVALID"),
+        passed, live_score (None when INVALID), average_scores, threshold, reason.
+        Scores are model outputs, not calibrated probabilities.
         """
         if frame_bgr is None or frame_bgr.size == 0:
-            return False, 0.0
+            return self._invalid("No usable frame.")
 
         h, w = frame_bgr.shape[:2]
 
         if bbox is None or len(bbox) != 4:
-            return False, 0.0
+            return self._invalid("No usable face bounding box.")
 
         x1, y1, x2, y2 = bbox
         box_x = max(0, int(x1))
@@ -171,7 +197,7 @@ class PassiveLivenessEngine:
         box_h = int(y2 - y1)
 
         if box_w <= 0 or box_h <= 0 or box_x >= w or box_y >= h:
-            return False, 0.0
+            return self._invalid("Face bounding box is empty or outside the frame.")
 
         # Collect softmax score vectors from each loaded model
         model_scores = []
@@ -189,10 +215,10 @@ class PassiveLivenessEngine:
                 )
             except Exception as e:
                 print(f"[WARN] Anti-spoof crop failed for {entry['name']}: {e}")
-                return False, 0.0
+                return self._invalid("Face crop failed.")
 
             if crop is None or crop.size == 0 or crop.shape[:2] != (in_h, in_w):
-                return False, 0.0
+                return self._invalid("Face crop is empty or has the wrong size.")
 
             # Preserve OpenCV BGR order and float32 in range [0, 255]
             tensor = (
@@ -208,16 +234,19 @@ class PassiveLivenessEngine:
                 model_scores.append(scores)
             except Exception as e:
                 print(f"[WARN] Anti-spoof inference failed for {entry['name']}: {e}")
-                return False, 0.0
+                return self._invalid("Model inference failed.")
 
         if not model_scores:
-            return False, 0.0
+            return self._invalid("No model scores were produced.")
 
-        decision = evaluate_liveness(model_scores, threshold=self.threshold)
-        passed = bool(decision["passed"])
-        live_score = float(decision["live_score"]) if decision["live_score"] is not None else 0.0
+        return evaluate_liveness(model_scores, threshold=self.threshold)
 
-        return passed, live_score
+
+def decision_to_result(decision: dict) -> Tuple[bool, float]:
+    """Converts an evaluate() decision to the legacy (is_real, live_score) tuple."""
+    passed = bool(decision["passed"])
+    live_score = float(decision["live_score"]) if decision["live_score"] is not None else 0.0
+    return passed, live_score
 
 
 if __name__ == "__main__":
