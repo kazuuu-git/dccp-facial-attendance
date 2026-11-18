@@ -13,9 +13,12 @@ Tuning (environment variables):
   DCCP_ORT_THREADS        ONNX Runtime threads (default 2, read in matcher.py)
   DCCP_EMPLOYEE_LOCKOUT   cooldown before re-logging the same employee (default 60s)
   DCCP_SPOOF_COOLDOWN     cooldown between repeated spoof log alerts (default 4s)
+  DCCP_MAX_READ_FAILURES  consecutive failed camera reads before the scanner stops
+                          with exit code 2 (positive integer, default 30)
 """
 
 import os
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -31,6 +34,52 @@ SPOOF_COOLDOWN_SECONDS = float(os.getenv("DCCP_SPOOF_COOLDOWN", "4.0"))
 
 READY_BANNER = "Ready: Look at camera (Press 'e' to test-enroll)"
 GREY = (200, 200, 200)
+ORANGE = (0, 165, 255)
+
+DEFAULT_MAX_READ_FAILURES = 30
+READ_RETRY_DELAY_SECONDS = 0.1
+WINDOW_TITLE = "DCCP AI Facial Attendance Scanner"
+
+EXIT_OK = 0
+EXIT_CAMERA_READ_FAILURE = 2
+EXIT_CONFIG_ERROR = 3
+EXIT_INTERRUPTED = 130
+
+
+class CameraReadError(RuntimeError):
+    """The camera stopped delivering usable frames; scanning has stopped."""
+
+
+class ScannerConfigError(ValueError):
+    """A scanner configuration value is invalid."""
+
+
+def parse_max_read_failures(raw: Optional[str]) -> int:
+    """Validates DCCP_MAX_READ_FAILURES. Unset or blank uses the default."""
+    if raw is None or raw.strip() == "":
+        return DEFAULT_MAX_READ_FAILURES
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise ScannerConfigError(
+            f"DCCP_MAX_READ_FAILURES must be a positive integer, got {raw!r}."
+        )
+    return value
+
+
+def _is_usable_frame(ret: bool, frame) -> bool:
+    """A read counts as successful only if it returned a non-empty image array."""
+    return bool(ret) and isinstance(frame, np.ndarray) and frame.ndim >= 2 and frame.size > 0
+
+
+def _camera_backend_name(cap) -> str:
+    """Best-effort backend name for diagnostics; never fails camera operation."""
+    try:
+        return str(cap.getBackendName())
+    except Exception:
+        return "unknown"
 
 # Required components. There is deliberately NO fallback: an always-pass liveness
 # stub or an in-memory database would let the scanner record attendance or enroll
@@ -69,8 +118,20 @@ def run_attendance_scanner(
     lockout_seconds: float = EMPLOYEE_LOCKOUT_SECONDS,
     spoof_cooldown_seconds: float = SPOOF_COOLDOWN_SECONDS,
     process_interval: float = PROCESS_INTERVAL,
+    max_read_failures: Optional[int] = None,
+    read_retry_delay: float = READ_RETRY_DELAY_SECONDS,
 ) -> None:
-    """Runs the real-time DCCP employee attendance kiosk loop."""
+    """Runs the real-time DCCP employee attendance kiosk loop.
+
+    Raises CameraReadError if the camera returns `max_read_failures` unusable
+    frames in a row, and ScannerConfigError for invalid configuration.
+    """
+    # Validate configuration before loading models or touching the camera.
+    if max_read_failures is None:
+        max_read_failures = parse_max_read_failures(os.getenv("DCCP_MAX_READ_FAILURES"))
+    elif isinstance(max_read_failures, bool) or not isinstance(max_read_failures, int) or max_read_failures < 1:
+        raise ScannerConfigError(f"max_read_failures must be a positive integer, got {max_read_failures!r}.")
+
     db = AttendanceDatabase()
     liveness_engine = PassiveLivenessEngine()
     recognition_engine = FaceRecognitionEngine()
@@ -80,38 +141,81 @@ def run_attendance_scanner(
     print(f"[INFO] Recognition interval: {process_interval:.2f}s | Min face width: {MIN_FACE_WIDTH}px | Lockout: {lockout_seconds:.0f}s")
     print("[CONTROLS] Press 'e' to quick-enroll your face for testing | Press 'q' to quit.")
 
-    # Open the camera ONCE, then configure it.
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open webcam at index {camera_index}.")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 15)
-
-    last_logged_time: Dict[str, float] = {}
-    status_banner = READY_BANNER
-    banner_color = GREY
-
-    bbox: Optional[list] = None  # cached between recognition cycles (for drawing only)
-    last_proc = 0.0
     rec_times: List[float] = []
     live_times: List[float] = []
 
-    def _get_db_mtime() -> float:
-        try:
-            return os.path.getmtime(db.db_path) if os.path.exists(db.db_path) else 0.0
-        except OSError:
-            return 0.0
-
-    last_db_mtime = _get_db_mtime()
-    last_db_check = 0.0
-
+    # Open the camera ONCE. Everything after this point runs inside try/finally so
+    # the camera is released and windows are closed on any exit, including Ctrl+C.
+    cap = cv2.VideoCapture(camera_index)
     try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open webcam at index {camera_index}.")
+        backend = _camera_backend_name(cap)
+        print(f"[INFO] Camera opened: index {camera_index}, backend {backend}.")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 15)
+
+        last_logged_time: Dict[str, float] = {}
+        status_banner = READY_BANNER
+        banner_color = GREY
+
+        bbox: Optional[list] = None  # cached between recognition cycles (for drawing only)
+        last_proc = 0.0
+        consecutive_read_failures = 0
+        frame_shape = (480, 640, 3)
+
+        def _get_db_mtime() -> float:
+            try:
+                return os.path.getmtime(db.db_path) if os.path.exists(db.db_path) else 0.0
+            except OSError:
+                return 0.0
+
+        last_db_mtime = _get_db_mtime()
+        last_db_check = 0.0
+
         while True:
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not _is_usable_frame(ret, frame):
+                consecutive_read_failures += 1
+                # Cached results describe an earlier frame: drop them so nothing
+                # (e.g. a previous PASS) is shown for input we did not receive, and
+                # force fresh recognition on the next usable frame.
+                bbox = None
+                status_banner, banner_color = READY_BANNER, GREY
+                last_proc = 0.0
 
+                if consecutive_read_failures == 1:
+                    print("[WARN] Camera returned no usable frame; retrying.")
+                if consecutive_read_failures >= max_read_failures:
+                    raise CameraReadError(
+                        f"Camera read failed {consecutive_read_failures} times in a row "
+                        f"(camera index {camera_index}, backend {backend}). Possible causes "
+                        "include another application using the camera or the camera being "
+                        "disconnected; the cause has not been diagnosed. Scanning has stopped."
+                    )
+
+                # Replace the last displayed image so no stale result stays on screen.
+                status_frame = np.zeros(frame_shape, dtype=np.uint8)
+                cv2.putText(
+                    status_frame,
+                    f"Camera frame unavailable - retrying ({consecutive_read_failures}/{max_read_failures})",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ORANGE, 2,
+                )
+                cv2.putText(
+                    status_frame,
+                    "Scanning paused: no faces are being checked.",
+                    (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ORANGE, 2,
+                )
+                cv2.imshow(WINDOW_TITLE, status_frame)
+                # The pause doubles as the window's event pump; 'q' still quits.
+                key = cv2.waitKey(max(1, int(read_retry_delay * 1000))) & 0xFF
+                if key == ord("q"):
+                    break
+                continue
+
+            consecutive_read_failures = 0
+            frame_shape = frame.shape if frame.ndim == 3 else frame_shape
             display_frame = frame.copy()
             now_ts = time.time()
 
@@ -197,7 +301,7 @@ def run_attendance_scanner(
                 banner_color,
                 2,
             )
-            cv2.imshow("DCCP AI Facial Attendance Scanner", display_frame)
+            cv2.imshow(WINDOW_TITLE, display_frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("e"):
@@ -220,11 +324,34 @@ def run_attendance_scanner(
             elif key == ord("q"):
                 break
     finally:
-        cap.release()
-        cv2.destroyAllWindows()
+        # Each cleanup step runs even if an earlier one fails.
+        try:
+            cap.release()
+        except Exception as err:
+            print(f"[WARN] Camera release failed: {err}")
+        try:
+            cv2.destroyAllWindows()
+        except Exception as err:
+            print(f"[WARN] Closing scanner windows failed: {err}")
         _print_latency("recognition", rec_times)
         _print_latency("liveness", live_times)
 
 
+def main() -> int:
+    """Runs the scanner and maps known failures to process exit codes."""
+    try:
+        run_attendance_scanner()
+    except CameraReadError as err:
+        print(f"[ERROR] {err}", file=sys.stderr)
+        return EXIT_CAMERA_READ_FAILURE
+    except ScannerConfigError as err:
+        print(f"[ERROR] Invalid scanner configuration: {err}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    except KeyboardInterrupt:
+        print("[INFO] Scanner interrupted (Ctrl+C). Scanning has stopped.")
+        return EXIT_INTERRUPTED
+    return EXIT_OK
+
+
 if __name__ == "__main__":
-    run_attendance_scanner()
+    sys.exit(main())
