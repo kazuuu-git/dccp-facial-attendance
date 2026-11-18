@@ -32,60 +32,25 @@ SPOOF_COOLDOWN_SECONDS = float(os.getenv("DCCP_SPOOF_COOLDOWN", "4.0"))
 READY_BANNER = "Ready: Look at camera (Press 'e' to test-enroll)"
 GREY = (200, 200, 200)
 
-# Import Corliss's Passive Liveness module
+# Required components. There is deliberately NO fallback: an always-pass liveness
+# stub or an in-memory database would let the scanner record attendance or enroll
+# faces without real verification or persistence. Fail before any camera work.
 try:
     from src.liveness.anti_spoof import PassiveLivenessEngine
-    print("[INFO] Loaded REAL PassiveLivenessEngine.")
 except Exception as e:
-    print(f"[WARN] Failed to load real PassiveLivenessEngine ({e}). Using temporary mock.")
+    raise ImportError(
+        "Scanner cannot start: required passive liveness module "
+        f"'src.liveness.anti_spoof' failed to import ({type(e).__name__}: {e}). "
+        "Install the liveness dependencies before running the scanner."
+    ) from e
 
-    class PassiveLivenessEngine:  # type: ignore[no-redef]
-        """Temporary fallback if liveness dependencies are not installed."""
-
-        def check_passive_liveness(
-            self, frame_bgr: np.ndarray, bbox: Optional[list] = None
-        ) -> Tuple[bool, float]:
-            return True, 0.99
-
-
-# Import Earl's SQLite Database module
 try:
     from src.database.db_manager import AttendanceDatabase
-    print("[INFO] Loaded REAL AttendanceDatabase.")
 except Exception as e:
-    print(f"[WARN] Failed to load real AttendanceDatabase ({e}). Using temporary mock.")
-
-    class AttendanceDatabase:  # type: ignore[no-redef]
-        """Temporary in-memory fallback if SQLite module fails."""
-
-        def __init__(self) -> None:
-            self._enrolled: Dict[str, np.ndarray] = {}
-            self._toggle_state: Dict[str, str] = {}
-
-        def load_enrolled_embeddings(self) -> Dict[str, np.ndarray]:
-            return self._enrolled
-
-        def enroll_employee(
-            self, employee_id: str, full_name: str, embedding: np.ndarray
-        ) -> bool:
-            self._enrolled[employee_id] = embedding
-            return True
-
-        def log_attendance(
-            self,
-            employee_id: Optional[str],
-            spoof_detected: bool,
-            liveness_score: float = 0.0,
-            similarity_score: float = 0.0,
-        ) -> str:
-            if spoof_detected or employee_id is None:
-                print(f"[MOCK DB] Logged SPOOF_BLOCKED (Liveness={liveness_score:.2f})")
-                return "SPOOF_BLOCKED"
-            prev = self._toggle_state.get(employee_id, "TIME_OUT")
-            action = "TIME_IN" if prev == "TIME_OUT" else "TIME_OUT"
-            self._toggle_state[employee_id] = action
-            print(f"[MOCK DB] Logged {action} for {employee_id} (Sim={similarity_score:.2f})")
-            return action
+    raise ImportError(
+        "Scanner cannot start: required database module "
+        f"'src.database.db_manager' failed to import ({type(e).__name__}: {e})."
+    ) from e
 
 
 def _print_latency(name: str, samples_s: List[float]) -> None:
@@ -252,6 +217,7 @@ def run_attendance_scanner(
                         except Exception as err:
                             print(f"[WARN] In-memory enroll succeeded, DB save failed: {err}")
                             status_banner, banner_color = "Enrolled DCCP-KARL-001 (Session Only)!", (0, 200, 0)
+            elif key == ord("q"):
                 break
     finally:
         cap.release()

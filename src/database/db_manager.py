@@ -198,11 +198,14 @@ class AttendanceDatabase:
                 print(f"[DB] Logged SPOOF_BLOCKED for {emp} (Score: {liveness_score:.2f})")
                 return "SPOOF_BLOCKED"
 
-            # Case 2: Verified employee — find today's latest open session
+            # Case 2: Verified employee — find today's latest open session.
+            # Blocked audit rows also have time_out = '--' (and time_in = '--'),
+            # so only a genuine TIME_IN row may be treated as an open session.
             cursor.execute(
                 """
                 SELECT id, time_in, time_out FROM logs
                 WHERE employee_id = ? AND date = ? AND time_out = '--'
+                  AND spoof_status = 'Passed' AND time_in <> '--'
                 ORDER BY id DESC LIMIT 1;
                 """,
                 (employee_id, date_str),
