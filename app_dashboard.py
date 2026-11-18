@@ -11,23 +11,47 @@ st.set_page_config(
 def main():
     st.markdown("""
         <style>
-        button[kind="primary"] {
-            background-color: #3b82f6 !important;
-            border-color: #3b82f6 !important;
-            color: white !important;
-        }
-        button[kind="primary"]:hover, button[kind="primary"]:active, button[kind="primary"]:focus {
+        /* :not(:disabled) keeps Streamlit's own disabled styling visible. */
+        button[kind="primary"]:not(:disabled),
+        button[kind="primaryFormSubmit"]:not(:disabled) {
             background-color: #2563eb !important;
             border-color: #2563eb !important;
             color: white !important;
+        }
+        button[kind="primary"]:not(:disabled):hover,
+        button[kind="primary"]:not(:disabled):active,
+        button[kind="primary"]:not(:disabled):focus,
+        button[kind="primaryFormSubmit"]:not(:disabled):hover,
+        button[kind="primaryFormSubmit"]:not(:disabled):active,
+        button[kind="primaryFormSubmit"]:not(:disabled):focus {
+            background-color: #1d4ed8 !important;
+            border-color: #1d4ed8 !important;
+            color: white !important;
+        }
+        button[kind="primary"]:focus-visible,
+        button[kind="primaryFormSubmit"]:focus-visible {
+            outline: 2px solid #60a5fa !important;
+            outline-offset: 2px;
+        }
+        /* Destructive testing control: distinct from the blue active-navigation button. */
+        .st-key-reset_everything button[kind] {
+            background-color: #b91c1c !important;
+            border-color: #b91c1c !important;
+            color: white !important;
+        }
+        .st-key-reset_everything button[kind]:hover,
+        .st-key-reset_everything button[kind]:active,
+        .st-key-reset_everything button[kind]:focus {
+            background-color: #991b1b !important;
+            border-color: #991b1b !important;
         }
         </style>
     """, unsafe_allow_html=True)
 
     st.sidebar.markdown("""
         <div style="padding-bottom: 10px;">
-            <h2 style="margin-bottom: 0px; color: #3b82f6;">🏢 DCCP Console</h2>
-            <p style="margin-top: 5px; font-size: 0.95rem; color: #9ca3af;">AI Facial Attendance System</p>
+            <h2 style="margin-bottom: 0px; color: #3b82f6;">DCCP Console</h2>
+            <p style="margin-top: 5px; font-size: 0.95rem; color: inherit; opacity: 0.7;">AI Facial Attendance System</p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -50,7 +74,7 @@ def main():
     if "current_view" not in st.session_state:
         st.session_state.current_view = "Live Attendance Logs"
 
-    st.sidebar.markdown("<p style='color: #9ca3af; font-size: 0.9rem; margin-bottom: 5px;'>Navigation</p>", unsafe_allow_html=True)
+    st.sidebar.markdown("<p style='color: inherit; opacity: 0.7; font-size: 0.9rem; margin-bottom: 5px;'>Navigation</p>", unsafe_allow_html=True)
 
     # 2. Apply the 'icon' parameter directly to the buttons
     for view_name, config in menu_options.items():
@@ -73,7 +97,7 @@ def main():
             st.success("Attendance logs cleared!")
             st.rerun()
 
-        if st.button("Reset Everything", type="primary", icon=":material/warning:", use_container_width=True):
+        if st.button("Reset Everything", type="primary", icon=":material/warning:", use_container_width=True, key="reset_everything"):
             db = AttendanceDatabase()
             db.reset_database(clear_employees=True, clear_logs=True)
             st.warning("Database completely reset!")

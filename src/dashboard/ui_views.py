@@ -12,30 +12,73 @@ def inject_custom_css():
     """Injects custom CSS to style the Streamlit interface cleanly."""
     st.markdown("""
         <style>
-        /* Custom Header Banners */
+        /* Custom Header Banners: colours derive from the active theme's text
+           colour (currentColor), so they follow light/dark switching. */
         .dashboard-header {
-            background: linear-gradient(90deg, #1f2937 0%, #111827 100%);
-            padding: 18px 24px;
-            border-radius: 12px;
-            border-left: 5px solid #3b82f6;
-            margin-bottom: 25px;
+            background: rgba(128, 128, 128, 0.06);
+            background: color-mix(in srgb, currentColor 4%, transparent);
+            border: 1px solid rgba(128, 128, 128, 0.2);
+            border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+            border-left: 4px solid #2563eb;
+            padding: 16px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
         }
-        .dashboard-header.green { border-left-color: #10b981; }
-        .dashboard-header.purple { border-left-color: #8b5cf6; }
-        
-        .dashboard-header h2 { margin: 0; color: #ffffff; font-size: 1.5rem; font-weight: 600; }
-        .dashboard-header p { margin: 4px 0 0 0; color: #9ca3af; font-size: 0.9rem; }
-        
-        /* Metric Card Styling */
-        div[data-testid="stMetric"] {
-            background-color: #1e222d;
-            border: 1px solid #2e3440;
-            padding: 15px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }
+        .dashboard-header h2 { margin: 0; padding: 0; color: inherit; font-size: 1.4rem; font-weight: 600; }
+        .dashboard-header p { margin: 4px 0 0 0; color: inherit; opacity: 0.72; font-size: 0.9rem; }
         </style>
     """, unsafe_allow_html=True)
+
+
+# Status filter options, matched against the values the database actually stores:
+# "Passed" for verified attendance, "Failed (...)" for blocked attempts.
+STATUS_ALL = "All"
+STATUS_PASSED = "Passed"
+STATUS_BLOCKED = "Blocked (liveness check did not pass)"
+STATUS_FILTER_OPTIONS = [STATUS_ALL, STATUS_PASSED, STATUS_BLOCKED]
+
+METRIC_HELP_ENTRIES = (
+    "Stored attendance and blocked-attempt rows. A time-in and its time-out "
+    "share one row. This is not a count of every camera scan."
+)
+METRIC_HELP_PASSED = (
+    "Rows where the face matched an enrolled employee and the liveness check "
+    "passed. The time-out, if any, is stored on the same row."
+)
+METRIC_HELP_BLOCKED = (
+    "Rows stored when the liveness check did not pass, for recognized or "
+    "unrecognized (UNKNOWN) faces. A blocked attempt is not necessarily a "
+    "confirmed spoof; failed or invalid checks are included. Repeated blocks "
+    "within the scanner's cooldown are stored once."
+)
+
+
+def summarize_logs(df):
+    """Returns (log entries, passed entries, blocked entries) for real log rows."""
+    total_logs = len(df)
+    passed_logs = len(df[df["spoof_status"] == "Passed"]) if "spoof_status" in df.columns else 0
+    return total_logs, passed_logs, total_logs - passed_logs
+
+
+def filter_logs_by_status(df, choice):
+    """Filters log rows by a STATUS_FILTER_OPTIONS choice using stored status values."""
+    if choice == STATUS_PASSED:
+        return df[df["spoof_status"] == "Passed"]
+    if choice == STATUS_BLOCKED:
+        return df[df["spoof_status"].astype(str).str.startswith("Failed")]
+    return df
+
+
+def _sample_preview_logs():
+    """Display-only layout preview rows. Never written to the database or exported."""
+    return pd.DataFrame({
+        "employee_id": ["SAMPLE-01", "SAMPLE-02", "SAMPLE-03", "SAMPLE-04"],
+        "date": ["2026-10-28", "2026-10-28", "2026-10-28", "2026-10-28"],
+        "time_in": ["07:45 AM", "07:52 AM", "08:05 AM", "--"],
+        "time_out": ["--", "--", "--", "--"],
+        "spoof_status": ["Passed", "Passed", "Passed", "Failed (Spoof Detected, Score: 0.12)"],
+    })
+
 
 def render_logs_view():
     inject_custom_css()
@@ -56,36 +99,34 @@ def render_logs_view():
     # Fetch real data from SQLite
     df = export_utils.fetch_attendance_logs()
 
-    # Fallback Data if empty
-    if df.empty:
-        st.info("Notice: `attendance.db` logs table is currently empty. Displaying layout preview:")
-        df = pd.DataFrame({
-            "employee_id": ["DCCP-1001", "DCCP-1002", "DCCP-1003", "DCCP-1004"],
-            "date": ["2026-10-28", "2026-10-28", "2026-10-28", "2026-10-28"],
-            "time_in": ["07:45 AM", "07:52 AM", "08:05 AM", "08:12 AM"],
-            "time_out": ["--", "--", "--", "--"],
-            "spoof_status": ["Passed", "Passed", "Passed", "Failed (Spoof Detected, Score: 0.12)"],
-        })
+    # Empty log: show a display-only sample table, but never derive counts from it.
+    is_sample = df.empty
+    if is_sample:
+        st.info(
+            "No attendance records found in the configured database. The table below is "
+            "**sample data for layout preview only**; it is not from the database."
+        )
+        df = _sample_preview_logs()
+        metric_values = ("—", "—", "—")
+    else:
+        metric_values = summarize_logs(df)
 
-    # Summary Metrics Row
-    total_logs = len(df)
-    passed_logs = len(df[df["spoof_status"] == "Passed"]) if "spoof_status" in df.columns else 0
-    failed_logs = total_logs - passed_logs
-    
     met1, met2, met3 = st.columns(3)
     with met1:
-        st.metric(label="Total Scans", value=total_logs)
+        st.metric(label="Log entries", value=metric_values[0], help=METRIC_HELP_ENTRIES, border=True)
     with met2:
-        st.metric(label="Live Faces Verified", value=passed_logs, delta="Secure")
+        st.metric(label="Passed entries", value=metric_values[1], help=METRIC_HELP_PASSED, border=True)
     with met3:
-        st.metric(label="Spoof Attacks Blocked", value=failed_logs, delta=f"-{failed_logs} Alert" if failed_logs > 0 else "0", delta_color="inverse")
+        st.metric(label="Blocked attempts", value=metric_values[2], help=METRIC_HELP_BLOCKED, border=True)
 
     st.divider()
 
     # Interactive Filter
-    status_filter = st.selectbox("Filter Display by Verification Status", ["All", "Passed", "Failed (2D Photo)", "Failed (3D Mask/Screen)"])
-    display_df = df if status_filter == "All" else df[df["spoof_status"] == status_filter]
+    status_filter = st.selectbox("Filter Display by Verification Status", STATUS_FILTER_OPTIONS)
+    display_df = filter_logs_by_status(df, status_filter)
 
+    if is_sample:
+        st.caption("Sample data: display only, not stored or exported.")
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
@@ -151,7 +192,6 @@ def render_enrollment_view():
 
                             st.toast(f"Embedding generated for {emp_id}!", icon="🧬")
                             st.success(f"✅ Successfully enrolled **{emp_name}** ({emp_id})! 512-D embedding saved to SQLite.")
-                            st.balloons()
                 except Exception as e:
                     st.error(f"Enrollment failed: {e}")
 
@@ -167,33 +207,33 @@ def render_export_view():
     """, unsafe_allow_html=True)
 
     df = export_utils.fetch_attendance_logs()
-
-    if df.empty:
-        df = pd.DataFrame({
-            "employee_id": ["DCCP-1001", "DCCP-1002"],
-            "date": ["2026-10-28", "2026-10-28"],
-            "time_in": ["07:45 AM", "07:52 AM"],
-            "time_out": ["05:00 PM", "05:00 PM"],
-            "spoof_status": ["Passed", "Passed"],
-        })
+    has_records = not df.empty
 
     col_filter, col_preview = st.columns([1, 2], gap="medium")
-    
+
     with col_filter:
         st.subheader("Filter Parameters")
-        st.date_input("Select Date Range")
-        
+        st.date_input("Select Date Range", disabled=True)
+        st.caption("Date-range filtering is not implemented. Export includes all recorded dates.")
+
         st.write("---")
-        csv_data = export_utils.convert_df_to_csv(df)
+        st.caption(
+            "The download includes both passed and blocked log entries. "
+            "It is a raw attendance-log export, not a calculated payroll report."
+        )
         st.download_button(
-            label="Download CSV Payroll Report",
-            data=csv_data,
-            file_name="payroll_export.csv",
+            label="Download Attendance Log (CSV)",
+            data=export_utils.convert_df_to_csv(df) if has_records else b"",
+            file_name="attendance_log_export.csv",
             mime="text/csv",
             type="primary",
-            use_container_width=True
+            use_container_width=True,
+            disabled=not has_records,
         )
 
     with col_preview:
         st.subheader("Live Data Preview")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        if has_records:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No attendance records to export yet.")

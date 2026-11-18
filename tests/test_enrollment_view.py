@@ -2,8 +2,8 @@
 Regression tests for the dashboard enrollment path (src/dashboard/ui_views.py).
 
 Verifies that the merged UI cannot enroll a face unless passive liveness passes,
-and that success feedback (toast, success message, balloons) only appears after
-the embedding has actually been saved.
+and that success feedback (toast, success message) only appears after the
+embedding has actually been saved.
 
 Streamlit, the camera image, face recognition and liveness are replaced with
 test doubles. Enrollment writes go to a temporary SQLite database.
@@ -106,7 +106,8 @@ class TestEnrollmentRequiresLiveness(unittest.TestCase):
     def test_passing_liveness_enrolls_then_shows_feedback(self):
         h = self._run(liveness=(True, 0.9))
         self.assertEqual(h.enrolled_ids(), {EMP_ID})
-        self.assertEqual(h.events, ["enroll", "toast", "success", "balloons"])
+        self.assertEqual(h.events, ["enroll", "toast", "success"])
+        h.st.balloons.assert_not_called()
 
     def test_no_face_skips_liveness_and_enrollment(self):
         h = self._run(face_found=False)
