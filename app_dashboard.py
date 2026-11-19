@@ -65,6 +65,10 @@ def main():
             "func": ui_views.render_enrollment_view, 
             "icon": ":material/person_add:"
         },
+        "Manage Personnel": {
+            "func": ui_views.render_manage_personnel_view,
+            "icon": ":material/badge:"
+        },
         "Export Payroll Data": {
             "func": ui_views.render_export_view, 
             "icon": ":material/folder_zip:"

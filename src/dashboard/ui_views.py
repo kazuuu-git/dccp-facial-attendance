@@ -1,3 +1,4 @@
+from datetime import datetime
 import cv2
 import numpy as np
 import pandas as pd
@@ -73,6 +74,7 @@ def _sample_preview_logs():
     """Display-only layout preview rows. Never written to the database or exported."""
     return pd.DataFrame({
         "employee_id": ["SAMPLE-01", "SAMPLE-02", "SAMPLE-03", "SAMPLE-04"],
+        "full_name": ["Juan Dela Cruz", "Maria Santos", "Pedro Penduko", "Unknown / Not Enrolled"],
         "date": ["2026-10-28", "2026-10-28", "2026-10-28", "2026-10-28"],
         "time_in": ["07:45 AM", "07:52 AM", "08:05 AM", "--"],
         "time_out": ["--", "--", "--", "--"],
@@ -196,9 +198,81 @@ def render_enrollment_view():
                     st.error(f"Enrollment failed: {e}")
 
 
+def render_manage_personnel_view():
+    inject_custom_css()
+
+    st.markdown("""
+        <div class="dashboard-header blue">
+            <h2>Personnel Directory & Management</h2>
+            <p>Inspect enrolled company personnel, verify biometric registration, and manage active records.</p>
+        </div>
+    """, unsafe_allow_html=True)
+
+    db = AttendanceDatabase()
+    emp_df = export_utils.fetch_enrolled_employees()
+    total_enrolled = len(emp_df)
+
+    col_m1, col_m2 = st.columns([1, 3])
+    with col_m1:
+        st.metric(label="Total Enrolled Personnel", value=total_enrolled, border=True)
+    with col_m2:
+        search_query = st.text_input("🔍 Search Personnel", placeholder="Filter by Employee ID or Full Name...")
+
+    st.divider()
+
+    if emp_df.empty:
+        st.info("No personnel currently enrolled in the database. Use the **Enroll New Employee** module to register personnel.")
+    else:
+        filtered_df = emp_df.copy()
+        if search_query:
+            q = search_query.lower()
+            filtered_df = filtered_df[
+                filtered_df["employee_id"].astype(str).str.lower().str.contains(q)
+                | filtered_df["full_name"].astype(str).str.lower().str.contains(q)
+            ]
+
+        col_table, col_del = st.columns([2, 1], gap="medium")
+
+        with col_table:
+            st.subheader("Active Roster")
+            st.dataframe(
+                filtered_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "employee_id": "Employee ID",
+                    "full_name": "Full Name",
+                    "created_at": "Enrolled On",
+                },
+            )
+
+        with col_del:
+            st.subheader("Deregister Employee")
+            st.caption("Permanently remove an employee profile and facial embedding from the system.")
+
+            emp_choices = [
+                f"{row['employee_id']} — {row['full_name']}"
+                for _, row in emp_df.iterrows()
+            ]
+            selected_emp_del = st.selectbox("Select Employee to Deregister", options=emp_choices)
+
+            if selected_emp_del:
+                del_id = selected_emp_del.split(" — ")[0]
+                confirm_del = st.checkbox(f"Confirm deletion of {del_id}", key="confirm_emp_del")
+
+                if st.button("🗑️ Delete Employee", type="primary", disabled=not confirm_del, use_container_width=True):
+                    success = db.delete_employee(del_id)
+                    if success:
+                        st.toast(f"Deleted {del_id} from database!", icon="🗑️")
+                        st.success(f"Employee {del_id} removed. Active roster will auto-sync with the kiosk.")
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to delete {del_id}. Record may have already been removed.")
+
+
 def render_export_view():
     inject_custom_css()
-    
+
     st.markdown("""
         <div class="dashboard-header purple">
             <h2>Data Export Hub</h2>
@@ -213,27 +287,77 @@ def render_export_view():
 
     with col_filter:
         st.subheader("Filter Parameters")
-        st.date_input("Select Date Range", disabled=True)
-        st.caption("Date-range filtering is not implemented. Export includes all recorded dates.")
+
+        # 1. Employee filter
+        emp_options = ["All Personnel"]
+        if has_records and "employee_id" in df.columns:
+            unique_emps = df[["employee_id", "full_name"]].drop_duplicates()
+            for _, r in unique_emps.iterrows():
+                eid = str(r["employee_id"])
+                fname = str(r.get("full_name", ""))
+                label = f"{eid} — {fname}" if fname and fname != "Unknown / Not Enrolled" else eid
+                emp_options.append(label)
+        selected_emp = st.selectbox("Select Employee", options=emp_options, disabled=not has_records)
+
+        # 2. Date Range filter
+        today = datetime.now().date()
+        date_selection = st.date_input("Select Date Range", value=(today, today), disabled=not has_records)
+
+        # 3. Status filter (Payroll vs Audit)
+        payroll_only = st.checkbox(
+            "Payroll-ready only (exclude failed/spoof attempts)",
+            value=False,
+            disabled=not has_records,
+        )
 
         st.write("---")
+
+        # Apply filtering
+        filtered_export_df = df.copy() if has_records else pd.DataFrame()
+
+        if has_records:
+            # Employee filter
+            if selected_emp != "All Personnel":
+                target_id = selected_emp.split(" — ")[0]
+                filtered_export_df = filtered_export_df[filtered_export_df["employee_id"] == target_id]
+
+            # Date filter (handles single date or range tuple)
+            if isinstance(date_selection, (list, tuple)) and len(date_selection) == 2:
+                start_date, end_date = date_selection
+                start_str = start_date.strftime("%Y-%m-%d")
+                end_str = end_date.strftime("%Y-%m-%d")
+                filtered_export_df = filtered_export_df[
+                    (filtered_export_df["date"] >= start_str) & (filtered_export_df["date"] <= end_str)
+                ]
+            elif isinstance(date_selection, (list, tuple)) and len(date_selection) == 1:
+                start_str = date_selection[0].strftime("%Y-%m-%d")
+                filtered_export_df = filtered_export_df[filtered_export_df["date"] >= start_str]
+
+            # Status filter
+            if payroll_only:
+                filtered_export_df = filtered_export_df[filtered_export_df["spoof_status"] == "Passed"]
+
+        has_filtered_records = not filtered_export_df.empty
+
         st.caption(
-            "The download includes both passed and blocked log entries. "
-            "It is a raw attendance-log export, not a calculated payroll report."
+            f"Export contains **{len(filtered_export_df)}** record(s) matching current filters."
         )
+
         st.download_button(
             label="Download Attendance Log (CSV)",
-            data=export_utils.convert_df_to_csv(df) if has_records else b"",
+            data=export_utils.convert_df_to_csv(filtered_export_df) if has_filtered_records else b"",
             file_name="attendance_log_export.csv",
             mime="text/csv",
             type="primary",
             use_container_width=True,
-            disabled=not has_records,
+            disabled=not has_filtered_records,
         )
 
     with col_preview:
         st.subheader("Live Data Preview")
-        if has_records:
-            st.dataframe(df, use_container_width=True, hide_index=True)
+        if has_filtered_records:
+            st.dataframe(filtered_export_df, use_container_width=True, hide_index=True)
+        elif has_records:
+            st.info("No records match the selected filter criteria.")
         else:
             st.info("No attendance records to export yet.")
