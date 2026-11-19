@@ -216,6 +216,7 @@ def run_attendance_scanner(
     liveness_engine = PassiveLivenessEngine()
     recognition_engine = FaceRecognitionEngine()
 
+    id_to_name: Dict[str, str] = {}
     if diagnostics:
         enrolled_db = roster.embeddings
         print("[DIAGNOSTICS] No attendance records, blocked attempts or enrollments will be written.")
@@ -224,7 +225,7 @@ def run_attendance_scanner(
         else:
             print(f"[DIAGNOSTICS] Read-only roster loaded: {roster.employee_count} enrolled profile(s).")
     else:
-        enrolled_db = db.load_enrolled_embeddings()
+        enrolled_db, id_to_name = db.load_enrolled_profiles()
         print(f"[INFO] Loaded {len(enrolled_db)} enrolled DCCP employee profile(s).")
     print(f"[INFO] Recognition interval: {process_interval:.2f}s | Min face width: {MIN_FACE_WIDTH}px | Lockout: {lockout_seconds:.0f}s")
     if diagnostics:
@@ -333,7 +334,7 @@ def run_attendance_scanner(
                         enrolled_db = roster.embeddings
                 elif current_mtime != last_db_mtime:
                     last_db_mtime = current_mtime
-                    new_enrolled = db.load_enrolled_embeddings()
+                    new_enrolled, new_names = db.load_enrolled_profiles()
                     if set(new_enrolled.keys()) != set(enrolled_db.keys()):
                         print(
                             f"[INFO] Enrolled roster synced with DB! Active profiles: {len(new_enrolled)} "
@@ -342,6 +343,7 @@ def run_attendance_scanner(
                         # Clear in-memory cooldown so newly reset tests aren't locked out
                         last_logged_time.clear()
                     enrolled_db = new_enrolled
+                    id_to_name = new_names
 
             # Heavy work runs only on a timer, never on every frame.
             if now_ts - last_proc >= process_interval:
@@ -387,10 +389,11 @@ def run_attendance_scanner(
 
                     elif emp_id is not None:
                         banner_color = (0, 200, 0)  # Green for verified employee
+                        emp_name = id_to_name.get(emp_id, emp_id)
                         elapsed = now_ts - last_logged_time.get(emp_id, 0.0)
                         if elapsed < lockout_seconds:
                             # Avoid accidental immediate double-logging
-                            status_banner = f"Already logged: {emp_id} (Please step aside)"
+                            status_banner = f"Already logged: {emp_name} (Please step aside)"
                         else:
                             action = db.log_attendance(
                                 employee_id=emp_id,
@@ -399,7 +402,7 @@ def run_attendance_scanner(
                                 similarity_score=sim_score,
                             )
                             last_logged_time[emp_id] = now_ts
-                            status_banner = f"{action}: {emp_id} (Sim: {sim_score:.2f})"
+                            status_banner = f"{action}: {emp_name} ({emp_id})"
 
                     else:
                         banner_color = (0, 165, 255)  # Orange for unknown live person
@@ -445,6 +448,7 @@ def run_attendance_scanner(
                         status_banner, banner_color = f"Enrollment {BLOCKED_BANNER}", RED
                     else:
                         enrolled_db["DCCP-KARL-001"] = emb
+                        id_to_name["DCCP-KARL-001"] = "Karl Stephen V. Zubiri"
                         try:
                             db.enroll_employee("DCCP-KARL-001", "Karl Stephen V. Zubiri", emb)
                             print("[INFO] Enrolled DCCP-KARL-001 and persisted to database!")
