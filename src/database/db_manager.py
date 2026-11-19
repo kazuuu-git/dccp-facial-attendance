@@ -157,6 +157,54 @@ class AttendanceDatabase:
                 return dict(row)
         return None
 
+    def list_employees(self) -> List[dict]:
+        """Returns list of enrolled employee records (excluding embedding blobs)."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT employee_id, full_name, created_at FROM employees ORDER BY full_name ASC;"
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_employee(self, employee_id: str) -> bool:
+        """Deletes an enrolled employee from the database by ID."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM employees WHERE employee_id = ?;",
+                (employee_id.strip(),),
+            )
+            deleted = cursor.rowcount > 0
+        if deleted:
+            print(f"[DB] Successfully deleted employee {employee_id}.")
+        return deleted
+
+    def load_enrolled_profiles(self) -> Tuple[Dict[str, np.ndarray], Dict[str, str]]:
+        """
+        Loads all enrolled employee embeddings and their corresponding full names.
+
+        Returns:
+            Tuple of (embeddings_dict, names_dict) mapping employee_id to vector and name.
+        """
+        enrolled: Dict[str, np.ndarray] = {}
+        names: Dict[str, str] = {}
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT employee_id, full_name, embedding FROM employees;")
+            for row in cursor.fetchall():
+                emp_id = row["employee_id"]
+                full_name = row["full_name"]
+                blob = row["embedding"]
+                embedding = np.frombuffer(blob, dtype=np.float32).copy()
+                if embedding.shape == (512,):
+                    enrolled[emp_id] = embedding
+                    names[emp_id] = full_name
+                else:
+                    print(
+                        f"[WARN] Skipping {emp_id}: invalid embedding shape {embedding.shape}"
+                    )
+        return enrolled, names
+
     def log_attendance(
         self,
         employee_id: Optional[str],
