@@ -21,14 +21,21 @@ def get_db_connection(db_path=None):
 
 
 def fetch_attendance_logs(db_path=None):
-    """Queries the database for all attendance records."""
+    """Queries the database for all attendance records joined with employee names."""
     conn = get_db_connection(db_path)
 
     # Selecting the specific data points required by the core architecture
     query = """
-        SELECT employee_id, date, time_in, time_out, spoof_status 
-        FROM logs 
-        ORDER BY id DESC, date DESC
+        SELECT 
+            l.employee_id,
+            COALESCE(e.full_name, 'Unknown / Not Enrolled') AS full_name,
+            l.date, 
+            l.time_in, 
+            l.time_out, 
+            l.spoof_status 
+        FROM logs l
+        LEFT JOIN employees e ON l.employee_id = e.employee_id
+        ORDER BY l.id DESC, l.date DESC
     """
 
     try:
@@ -37,6 +44,24 @@ def fetch_attendance_logs(db_path=None):
     except Exception as e:
         print(f"Database error: {e}")
         return pd.DataFrame()  # Return empty dataframe on failure
+    finally:
+        conn.close()
+
+
+def fetch_enrolled_employees(db_path=None):
+    """Queries the database for all enrolled employee profiles."""
+    conn = get_db_connection(db_path)
+    query = """
+        SELECT employee_id, full_name, created_at
+        FROM employees
+        ORDER BY full_name ASC
+    """
+    try:
+        df = pd.read_sql_query(query, conn)
+        return df
+    except Exception as e:
+        print(f"Database error fetching employees: {e}")
+        return pd.DataFrame()
     finally:
         conn.close()
 
