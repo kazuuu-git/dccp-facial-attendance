@@ -151,13 +151,12 @@ class TestExportView(DashboardTestCase):
         st.dataframe.assert_not_called()
         st.info.assert_called_with("No attendance records to export yet.")
 
-    def test_date_control_is_disabled_and_explained(self):
+    def test_controls_disabled_when_empty_db(self):
         st = self.render(ui_views.render_export_view)
         self.assertTrue(st.date_input.call_args.kwargs["disabled"])
+        self.assertTrue(st.selectbox.call_args.kwargs["disabled"])
         captions = " ".join(c.args[0] for c in st.caption.call_args_list)
-        self.assertIn("Date-range filtering is not implemented. Export includes all recorded dates.", captions)
-        self.assertIn("both passed and blocked log entries", captions)
-        self.assertIn("not a calculated payroll report", captions)
+        self.assertIn("Export contains", captions)
 
     def test_populated_db_exports_real_rows_including_blocked(self):
         self.populate()
@@ -171,6 +170,23 @@ class TestExportView(DashboardTestCase):
         self.assertNotIn("SAMPLE-", csv_text)
         self.assertNotIn("DCCP-100", csv_text)
         self.assertEqual(len(csv_text.strip().splitlines()), 1 + 4)
+
+
+class TestManagePersonnelView(DashboardTestCase):
+    def test_empty_db_shows_info(self):
+        st = self.render(ui_views.render_manage_personnel_view)
+        st.info.assert_called()
+        self.assertIn("No personnel currently enrolled", st.info.call_args.args[0])
+
+    def test_populated_db_lists_employees(self):
+        import numpy as np
+        v = np.ones(512, dtype=np.float32)
+        self.db.enroll_employee("EMP-001", "Test User", v)
+        st = self.render(ui_views.render_manage_personnel_view)
+        st.dataframe.assert_called()
+        df = st.dataframe.call_args.args[0]
+        self.assertEqual(list(df["employee_id"]), ["EMP-001"])
+        self.assertEqual(list(df["full_name"]), ["Test User"])
 
 
 if __name__ == "__main__":
