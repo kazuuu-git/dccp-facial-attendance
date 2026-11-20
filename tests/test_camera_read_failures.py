@@ -65,6 +65,9 @@ class FakeDatabase:
     def load_enrolled_embeddings(self):
         return {}
 
+    def load_enrolled_profiles(self):
+        return {}, {}
+
 
 class Harness:
     def __init__(self, script, keys=None, **capture_kwargs):
