@@ -261,3 +261,16 @@ models/*
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Exports, temporary outputs and local secrets
+exports/
+*_export.csv
+payroll_export*.csv
+tmp/
+temp/
+.env.*
+!.env.example
+secrets.toml
+credentials*.json
+*.pem
+*.key

@@ -1,9 +1,9 @@
 """
 Milestone 2: Passive Liveness & Anti-Spoofing Detection
-Owner: Corliss (Implementation & Callable Engine Interface)
+Owner: Corliss (Implementation, Callable Engine Interface, and Threshold Policy)
 
-Uses MiniFASNetV2 to detect presentation attacks (printed photos, replay screens).
-Integrates directly with app_scanner.py via PassiveLivenessEngine.
+Uses MiniFASNet models to detect presentation attacks (printed photos, replay screens).
+Integrates directly with app_scanner.py and app_dashboard.py via PassiveLivenessEngine.
 """
 
 import os
@@ -14,50 +14,103 @@ import cv2
 import numpy as np
 import torch
 
+from .threshold import evaluate_liveness
 from .vendor.generate_patches import CropImage
-from .vendor.MiniFASNet import MiniFASNetV2
+from .vendor.MiniFASNet import MiniFASNetV1SE, MiniFASNetV2
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+WEIGHTS_DIR = PROJECT_ROOT / "models" / "antispoof"
+DEFAULT_WEIGHTS_PATH = WEIGHTS_DIR / "2.7_80x80_MiniFASNetV2.pth"
 
-WEIGHTS_PATH = (
-    PROJECT_ROOT
-    / "models"
-    / "antispoof"
-    / "2.7_80x80_MiniFASNetV2.pth"
-)
+MODEL_CONFIGS = {
+    "2.7_80x80_MiniFASNetV2.pth": {
+        "model_fn": MiniFASNetV2,
+        "conv6_kernel": (5, 5),
+        "num_classes": 3,
+        "crop_scale": 2.7,
+        "input_size": (80, 80),
+    },
+    "4_0_0_80x80_MiniFASNetV1SE.pth": {
+        "model_fn": MiniFASNetV1SE,
+        "conv6_kernel": (5, 5),
+        "num_classes": 3,
+        "crop_scale": 4.0,
+        "input_size": (80, 80),
+    },
+}
 
 
-def load_model(weights_path: Optional[Union[str, Path]] = None) -> MiniFASNetV2:
-    """Loads the pretrained MiniFASNetV2 checkpoint on CPU."""
-    target_path = Path(weights_path) if weights_path else WEIGHTS_PATH
-    if not target_path.is_file():
-        raise FileNotFoundError(f"Missing anti-spoof checkpoint: {target_path}")
-
-    model = MiniFASNetV2(conv6_kernel=(5, 5), num_classes=3)
-
-    weights = torch.load(
-        target_path,
-        map_location="cpu",
-        weights_only=True,
-    )
-
-    weights = {
+def _clean_state_dict(weights):
+    return {
         name.removeprefix("module."): value
         for name, value in weights.items()
     }
 
-    model.load_state_dict(weights, strict=True)
+
+def _load_checkpoint(checkpoint_path: Path):
+    if checkpoint_path.name not in MODEL_CONFIGS:
+        raise ValueError(f"Unsupported checkpoint: {checkpoint_path.name}")
+
+    config = MODEL_CONFIGS[checkpoint_path.name]
+
+    model = config["model_fn"](
+        conv6_kernel=config["conv6_kernel"],
+        num_classes=config["num_classes"],
+    )
+
+    weights = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+
+    model.load_state_dict(_clean_state_dict(weights), strict=True)
     model.eval()
 
-    return model
+    return {
+        "name": checkpoint_path.name,
+        "model": model,
+        "crop_scale": config["crop_scale"],
+        "input_size": config["input_size"],
+        "num_classes": config["num_classes"],
+    }
+
+
+def load_model(weights_path: Optional[Union[str, Path]] = None) -> MiniFASNetV2:
+    """Backward-compatible loader for the original MiniFASNetV2 model."""
+    target_path = Path(weights_path) if weights_path else DEFAULT_WEIGHTS_PATH
+    if not target_path.is_file():
+        raise FileNotFoundError(f"Missing anti-spoof checkpoint: {target_path}")
+
+    return _load_checkpoint(target_path)["model"]
+
+
+def load_models(weights_dir: Optional[Union[str, Path]] = None) -> list:
+    """Load every supported anti-spoofing checkpoint found in the weights folder."""
+    target_dir = Path(weights_dir) if weights_dir else WEIGHTS_DIR
+    loaded_models = []
+
+    for checkpoint_path in sorted(target_dir.glob("*.pth")):
+        if checkpoint_path.name not in MODEL_CONFIGS:
+            continue
+        loaded_models.append(_load_checkpoint(checkpoint_path))
+
+    if not loaded_models:
+        raise FileNotFoundError(
+            f"No supported anti-spoofing checkpoints found in: {target_dir}"
+        )
+
+    return loaded_models
 
 
 class PassiveLivenessEngine:
     """
-    Callable passive liveness inference engine expected by app_scanner.py.
-    
-    Extracts an 80x80 patch around the face bounding box (scale=2.7), feeds it into
-    MiniFASNetV2, and determines whether the face is genuine (Class 1) or a spoof attempt.
+    Authoritative passive liveness inference engine for kiosk and dashboard.
+
+    Extracts multi-scale patches around the face bounding box, feeds them into
+    the loaded MiniFASNet checkpoint(s), and applies the strict threshold policy:
+      1. LIVE (Class 1) must be the unique highest-scoring class (ties rejected).
+      2. Average live score must meet or exceed the configured threshold.
     """
 
     def __init__(
@@ -70,72 +123,130 @@ class PassiveLivenessEngine:
         else:
             self.threshold = float(threshold)
 
-        self.model = load_model(weights_path)
+        if not (0.0 <= self.threshold <= 1.0):
+            raise ValueError(f"Threshold must be between 0.0 and 1.0, got {self.threshold}")
+
+        if weights_path is not None:
+            path = Path(weights_path)
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing anti-spoof checkpoint: {path}")
+            self.model_entries = [_load_checkpoint(path)]
+        else:
+            self.model_entries = load_models(WEIGHTS_DIR)
+
         self.cropper = CropImage()
-        print(f"[INFO] PassiveLivenessEngine loaded MiniFASNetV2 (threshold={self.threshold:.2f}).")
+        model_names = [m["name"] for m in self.model_entries]
+        print(
+            f"[INFO] PassiveLivenessEngine initialized with {len(self.model_entries)} "
+            f"model(s): {model_names} (threshold={self.threshold:.2f})."
+        )
+
+    def _invalid(self, reason: str) -> dict:
+        """Decision for a check that could not be completed (no score is reported)."""
+        return {
+            "status": "INVALID",
+            "passed": False,
+            "live_score": None,
+            "average_scores": None,
+            "threshold": self.threshold,
+            "reason": reason,
+        }
 
     def check_passive_liveness(
         self, frame_bgr: np.ndarray, bbox: Optional[List[int]] = None
     ) -> Tuple[bool, float]:
         """
-        Evaluates whether a detected face is live or a spoof.
+        Evaluates whether a detected face is live or a spoof attack.
+
+        Backward-compatible wrapper around evaluate(); runs inference once.
 
         Args:
-            frame_bgr: Full frame from camera in BGR format.
-            bbox: Bounding box from InsightFace in [x1, y1, x2, y2] format.
+            frame_bgr: Full frame from camera in OpenCV BGR format.
+            bbox: Bounding box in [x1, y1, x2, y2] format.
 
         Returns:
             Tuple of (is_real: bool, liveness_score: float)
-            - is_real is True if the model predicts Class 1 (LIVE) and meets the threshold.
-            - liveness_score is the softmax probability for the LIVE class (0.0 to 1.0).
+            - is_real is True ONLY IF LIVE uniquely wins and live_score >= threshold.
+            - liveness_score is the average softmax score for the LIVE class
+              (0.0 when the check could not be completed).
+        """
+        return decision_to_result(self.evaluate(frame_bgr, bbox))
+
+    def evaluate(
+        self, frame_bgr: np.ndarray, bbox: Optional[List[int]] = None
+    ) -> dict:
+        """
+        Runs passive liveness inference once and returns the full decision.
+
+        Returns a dict with keys: status ("PASS" | "REJECT" | "INVALID"),
+        passed, live_score (None when INVALID), average_scores, threshold, reason.
+        Scores are model outputs, not calibrated probabilities.
         """
         if frame_bgr is None or frame_bgr.size == 0:
-            return False, 0.0
+            return self._invalid("No usable frame.")
 
         h, w = frame_bgr.shape[:2]
 
-        # Convert [x1, y1, x2, y2] from InsightFace to [x, y, box_w, box_h] for MiniFASNet
-        if bbox is not None and len(bbox) == 4:
-            x1, y1, x2, y2 = bbox
-            box_x = max(0, int(x1))
-            box_y = max(0, int(y1))
-            box_w = max(1, int(x2 - x1))
-            box_h = max(1, int(y2 - y1))
-        else:
-            # Fall back to center crop if bbox is omitted
-            box_x, box_y, box_w, box_h = 0, 0, w, h
+        if bbox is None or len(bbox) != 4:
+            return self._invalid("No usable face bounding box.")
 
-        # Crop face patch with MiniFASNet standard scale 2.7 to 80x80
-        try:
-            crop = self.cropper.crop(
-                org_img=frame_bgr,
-                bbox=[box_x, box_y, box_w, box_h],
-                scale=2.7,
-                out_w=80,
-                out_h=80,
-                crop=True,
+        x1, y1, x2, y2 = bbox
+        box_x = max(0, int(x1))
+        box_y = max(0, int(y1))
+        box_w = int(x2 - x1)
+        box_h = int(y2 - y1)
+
+        if box_w <= 0 or box_h <= 0 or box_x >= w or box_y >= h:
+            return self._invalid("Face bounding box is empty or outside the frame.")
+
+        # Collect softmax score vectors from each loaded model
+        model_scores = []
+
+        for entry in self.model_entries:
+            in_h, in_w = entry["input_size"]
+            try:
+                crop = self.cropper.crop(
+                    org_img=frame_bgr,
+                    bbox=[box_x, box_y, box_w, box_h],
+                    scale=entry["crop_scale"],
+                    out_w=in_w,
+                    out_h=in_h,
+                    crop=True,
+                )
+            except Exception as e:
+                print(f"[WARN] Anti-spoof crop failed for {entry['name']}: {e}")
+                return self._invalid("Face crop failed.")
+
+            if crop is None or crop.size == 0 or crop.shape[:2] != (in_h, in_w):
+                return self._invalid("Face crop is empty or has the wrong size.")
+
+            # Preserve OpenCV BGR order and float32 in range [0, 255]
+            tensor = (
+                torch.from_numpy(crop.transpose(2, 0, 1).copy())
+                .float()
+                .unsqueeze(0)
             )
-        except Exception as e:
-            print(f"[WARN] Anti-spoof crop failed: {e}")
-            return False, 0.0
 
-        # Prepare tensor: preserve OpenCV BGR order and 0-255 float range (as trained)
-        tensor = (
-            torch.from_numpy(crop.transpose(2, 0, 1).copy())
-            .float()
-            .unsqueeze(0)
-        )
+            try:
+                with torch.inference_mode():
+                    logits = entry["model"](tensor)
+                    scores = torch.softmax(logits, dim=1)[0].tolist()
+                model_scores.append(scores)
+            except Exception as e:
+                print(f"[WARN] Anti-spoof inference failed for {entry['name']}: {e}")
+                return self._invalid("Model inference failed.")
 
-        with torch.inference_mode():
-            logits = self.model(tensor)
-            scores = torch.softmax(logits, dim=1)[0]
+        if not model_scores:
+            return self._invalid("No model scores were produced.")
 
-        predicted_class = int(scores.argmax().item())
-        live_score = float(scores[1].item())
+        return evaluate_liveness(model_scores, threshold=self.threshold)
 
-        # Class 1 corresponds to live person in MiniFASNet
-        is_real = (predicted_class == 1) and (live_score >= self.threshold)
-        return is_real, live_score
+
+def decision_to_result(decision: dict) -> Tuple[bool, float]:
+    """Converts an evaluate() decision to the legacy (is_real, live_score) tuple."""
+    passed = bool(decision["passed"])
+    live_score = float(decision["live_score"]) if decision["live_score"] is not None else 0.0
+    return passed, live_score
 
 
 if __name__ == "__main__":
