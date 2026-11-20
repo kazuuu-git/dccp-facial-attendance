@@ -16,8 +16,14 @@ Newer Python versions may not support all packages.
      personnel, export).
    - **`attendance.bat`** – webcam attendance scanner (records attendance and
      blocked attempts). Press `q` in the camera window to stop.
-   - **`start.bat`** – liveness diagnostics only; nothing is recorded.
 
 If setup has not been completed, each launcher runs `START FIRST.bat` automatically.
-All launchers use the local test database `data\attendance-webcam-test.db`, which is
+Both launchers use the local test database `data\attendance-webcam-test.db`, which is
 created on first use and is never committed.
+
+To check liveness without recording anything (diagnostics mode), run from the
+project folder:
+
+```powershell
+.\.venv\Scripts\python.exe app_scanner.py --diagnostics
+```
