@@ -4,9 +4,15 @@ cd /d "%~dp0"
 
 set "DCCP_DB_PATH=%~dp0data\attendance-webcam-test.db"
 
-if not exist ".venv\Scripts\python.exe" (
-    echo ERROR: The project Python environment was not found.
-    echo Keep this launcher inside dccp-facial-attendance-test.
+if not exist ".venv\.dccp-setup-complete" (
+    echo The project environment is not set up yet.
+    echo Running "START FIRST.bat" now - this is a one-time setup.
+    echo.
+    call "%~dp0START FIRST.bat"
+)
+if not exist ".venv\.dccp-setup-complete" (
+    echo Setup did not finish. Fix the error shown above,
+    echo then run this launcher again.
     pause
     exit /b 1
 )
