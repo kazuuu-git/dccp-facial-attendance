@@ -226,9 +226,10 @@ def render_manage_personnel_view():
         filtered_df = emp_df.copy()
         if search_query:
             q = search_query.lower()
+            # regex=False: characters such as "(" or "*" are matched literally.
             filtered_df = filtered_df[
-                filtered_df["employee_id"].astype(str).str.lower().str.contains(q)
-                | filtered_df["full_name"].astype(str).str.lower().str.contains(q)
+                filtered_df["employee_id"].astype(str).str.lower().str.contains(q, regex=False)
+                | filtered_df["full_name"].astype(str).str.lower().str.contains(q, regex=False)
             ]
 
         col_table, col_del = st.columns([2, 1], gap="medium")
@@ -242,7 +243,7 @@ def render_manage_personnel_view():
                 column_config={
                     "employee_id": "Employee ID",
                     "full_name": "Full Name",
-                    "created_at": "Enrolled On",
+                    "created_at": "Enrolled On (UTC)",
                 },
             )
 
@@ -258,10 +259,15 @@ def render_manage_personnel_view():
 
             if selected_emp_del:
                 del_id = selected_emp_del.split(" — ")[0]
-                confirm_del = st.checkbox(f"Confirm deletion of {del_id}", key="confirm_emp_del")
+                # One confirmation per employee: a tick never carries over to the
+                # next person selected after a deletion.
+                confirm_key = f"confirm_emp_del_{del_id}"
+                confirm_del = st.checkbox(f"Confirm deletion of {del_id}", key=confirm_key)
 
-                if st.button("🗑️ Delete Employee", type="primary", disabled=not confirm_del, use_container_width=True):
+                if st.button("🗑️ Delete Employee", type="primary", disabled=not confirm_del,
+                             use_container_width=True, key="delete_employee"):
                     success = db.delete_employee(del_id)
+                    st.session_state.pop(confirm_key, None)
                     if success:
                         st.toast(f"Deleted {del_id} from database!", icon="🗑️")
                         st.success(f"Employee {del_id} removed. Active roster will auto-sync with the kiosk.")
@@ -299,13 +305,19 @@ def render_export_view():
                 emp_options.append(label)
         selected_emp = st.selectbox("Select Employee", options=emp_options, disabled=not has_records)
 
-        # 2. Date Range filter
+        # 2. Date Range filter: defaults to every recorded date, so an export
+        #    never silently covers only today.
         today = datetime.now().date()
-        date_selection = st.date_input("Select Date Range", value=(today, today), disabled=not has_records)
+        default_range = (today, today)
+        if has_records and "date" in df.columns:
+            recorded = pd.to_datetime(df["date"], format="%Y-%m-%d", errors="coerce").dropna()
+            if not recorded.empty:
+                default_range = (recorded.min().date(), recorded.max().date())
+        date_selection = st.date_input("Select Date Range", value=default_range, disabled=not has_records)
 
         # 3. Status filter (Payroll vs Audit)
         payroll_only = st.checkbox(
-            "Payroll-ready only (exclude failed/spoof attempts)",
+            "Payroll-ready only (exclude blocked attempts)",
             value=False,
             disabled=not has_records,
         )
@@ -341,6 +353,10 @@ def render_export_view():
 
         st.caption(
             f"Export contains **{len(filtered_export_df)}** record(s) matching current filters."
+        )
+        st.caption(
+            "Unless 'Payroll-ready only' is ticked, the download includes both passed and "
+            "blocked log entries. It is a raw attendance-log export, not a calculated payroll report."
         )
 
         st.download_button(

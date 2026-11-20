@@ -17,6 +17,7 @@ with synthetic employee IDs.
 
 import gc
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,13 +29,24 @@ from src.dashboard import ui_views
 from src.database.db_manager import AttendanceDatabase
 
 
-def fake_streamlit(selectbox_choice=ui_views.STATUS_ALL):
+def fake_streamlit(selectbox_choice=ui_views.STATUS_ALL, text_value="", checkbox_value=False,
+                   button_value=False):
+    """Mocked Streamlit whose widgets return the same defaults as the real UI.
+
+    The logs-view status filter returns `selectbox_choice`; every other selectbox
+    returns its first option. Date inputs return their default value.
+    """
     st = mock.MagicMock()
     st.columns.side_effect = lambda spec, **kw: [
         mock.MagicMock() for _ in range(spec if isinstance(spec, int) else len(spec))
     ]
-    st.button.return_value = False
-    st.selectbox.return_value = selectbox_choice
+    st.button.return_value = button_value
+    st.text_input.return_value = text_value
+    st.checkbox.return_value = checkbox_value
+    st.selectbox.side_effect = lambda label, options=None, *a, **k: (
+        selectbox_choice if label.startswith("Filter Display") else options[0]
+    )
+    st.date_input.side_effect = lambda label, value=None, *a, **k: value
     return st
 
 
@@ -157,6 +169,39 @@ class TestExportView(DashboardTestCase):
         self.assertTrue(st.selectbox.call_args.kwargs["disabled"])
         captions = " ".join(c.args[0] for c in st.caption.call_args_list)
         self.assertIn("Export contains", captions)
+        self.assertIn("both passed and blocked log entries", captions)
+        self.assertIn("not a calculated payroll report", captions)
+
+    def test_payroll_checkbox_wording_does_not_claim_spoofs(self):
+        st = self.render(ui_views.render_export_view)
+        label = st.checkbox.call_args.args[0]
+        self.assertEqual(label, "Payroll-ready only (exclude blocked attempts)")
+        self.assertNotIn("spoof", label.lower())
+
+    def test_default_date_range_covers_all_recorded_dates(self):
+        self.populate()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO logs (employee_id, date, time_in, time_out, spoof_status) "
+            "VALUES ('SYN-OLD', '2026-01-05', '08:00:00 AM', '05:00:00 PM', 'Passed')"
+        )
+        conn.commit()
+        conn.close()
+        st = self.render(ui_views.render_export_view)
+
+        start, end = st.date_input.call_args.kwargs["value"]
+        self.assertEqual(start.isoformat(), "2026-01-05")
+        csv_text = st.download_button.call_args.kwargs["data"].decode("utf-8")
+        self.assertIn("SYN-OLD", csv_text, "older dates are exported by default")
+        self.assertEqual(len(csv_text.strip().splitlines()), 1 + 5)
+
+    def test_payroll_only_excludes_blocked_rows(self):
+        self.populate()
+        st = self.render(ui_views.render_export_view, checkbox_value=True)
+        csv_text = st.download_button.call_args.kwargs["data"].decode("utf-8")
+        self.assertNotIn("UNKNOWN", csv_text)
+        self.assertNotIn("Failed", csv_text)
+        self.assertEqual(len(csv_text.strip().splitlines()), 1 + 2)
 
     def test_populated_db_exports_real_rows_including_blocked(self):
         self.populate()
@@ -187,6 +232,40 @@ class TestManagePersonnelView(DashboardTestCase):
         df = st.dataframe.call_args.args[0]
         self.assertEqual(list(df["employee_id"]), ["EMP-001"])
         self.assertEqual(list(df["full_name"]), ["Test User"])
+        self.assertEqual(st.dataframe.call_args.kwargs["column_config"]["created_at"], "Enrolled On (UTC)")
+
+    def _enroll_two(self):
+        import numpy as np
+        v = np.ones(512, dtype=np.float32)
+        self.db.enroll_employee("EMP-001", "Alpha User", v)
+        self.db.enroll_employee("EMP-002", "Bravo User", v)
+
+    def test_delete_confirmation_is_per_employee(self):
+        self._enroll_two()
+        st = self.render(ui_views.render_manage_personnel_view)
+        self.assertEqual(st.checkbox.call_args.kwargs["key"], "confirm_emp_del_EMP-001")
+        self.assertTrue(st.button.call_args.kwargs["disabled"], "delete stays disabled until confirmed")
+
+    def test_confirmed_delete_removes_employee_and_clears_its_confirmation(self):
+        self._enroll_two()
+        st = self.render(ui_views.render_manage_personnel_view, checkbox_value=True, button_value=True)
+        remaining = [e["employee_id"] for e in self.db.list_employees()]
+        self.assertEqual(remaining, ["EMP-002"])
+        st.session_state.pop.assert_called_with("confirm_emp_del_EMP-001", None)
+
+    def test_unconfirmed_delete_does_nothing(self):
+        self._enroll_two()
+        self.render(ui_views.render_manage_personnel_view, checkbox_value=False, button_value=False)
+        self.assertEqual(len(self.db.list_employees()), 2)
+
+    def test_search_with_special_characters_does_not_crash(self):
+        self._enroll_two()
+        for text in ["(", "*", "[a", "user"]:
+            with self.subTest(text=text):
+                st = self.render(ui_views.render_manage_personnel_view, text_value=text)
+                df = st.dataframe.call_args.args[0]
+                expected = 2 if text == "user" else 0
+                self.assertEqual(len(df), expected)
 
 
 if __name__ == "__main__":

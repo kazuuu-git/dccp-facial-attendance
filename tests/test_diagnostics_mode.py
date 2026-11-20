@@ -66,6 +66,9 @@ class FakeDatabase:
     def load_enrolled_embeddings(self):
         return {"SYN-0001": EMB}
 
+    def load_enrolled_profiles(self):
+        return {"SYN-0001": EMB}, {"SYN-0001": "Synthetic Person"}
+
 
 class FakeRoster:
     """Roster double with no write methods, like the real one."""

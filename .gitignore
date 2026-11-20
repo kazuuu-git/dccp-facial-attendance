@@ -274,3 +274,6 @@ secrets.toml
 credentials*.json
 *.pem
 *.key
+
+# Editor settings (personal)
+.vscode/

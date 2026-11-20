@@ -33,15 +33,19 @@ def main():
             outline: 2px solid #60a5fa !important;
             outline-offset: 2px;
         }
-        /* Destructive testing control: distinct from the blue active-navigation button. */
-        .st-key-reset_everything button[kind] {
+        /* Destructive controls: distinct from the blue active-navigation button. */
+        .st-key-reset_everything button[kind],
+        .st-key-delete_employee button[kind]:not(:disabled) {
             background-color: #b91c1c !important;
             border-color: #b91c1c !important;
             color: white !important;
         }
         .st-key-reset_everything button[kind]:hover,
         .st-key-reset_everything button[kind]:active,
-        .st-key-reset_everything button[kind]:focus {
+        .st-key-reset_everything button[kind]:focus,
+        .st-key-delete_employee button[kind]:not(:disabled):hover,
+        .st-key-delete_employee button[kind]:not(:disabled):active,
+        .st-key-delete_employee button[kind]:not(:disabled):focus {
             background-color: #991b1b !important;
             border-color: #991b1b !important;
         }

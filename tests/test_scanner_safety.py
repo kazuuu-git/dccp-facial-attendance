@@ -58,6 +58,9 @@ class FakeDatabase:
     def load_enrolled_embeddings(self):
         return {}
 
+    def load_enrolled_profiles(self):
+        return {}, {}
+
 
 class ScannerHarness:
     """Runs run_attendance_scanner with every external dependency replaced."""

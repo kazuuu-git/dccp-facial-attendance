@@ -1,0 +1,2 @@
+# Windows batch launchers must keep CRLF line endings on every clone.
+*.bat text eol=crlf
